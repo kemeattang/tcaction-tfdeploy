@@ -1,0 +1,199 @@
+name: "Terraform AWS Plan/Apply"
+description: "Init, plan, approve, and apply Terraform to AWS using GitHub OIDC"
+
+inputs:
+  aws_role_arn:
+    description: "AWS IAM role ARN to assume using GitHub OIDC"
+    required: true
+
+  aws_region:
+    description: "AWS region"
+    required: false
+    default: "us-east-1"
+
+  github_token:
+    description: "GitHub PAT used for private module fetches"
+    required: false
+    default: ""
+
+  working_directory:
+    description: "Terraform root directory"
+    required: false
+    default: ".cicd/iac"
+
+  environment:
+    description: "Environment being deployed"
+    required: false
+    default: "dev"
+
+  run_apply:
+    description: "If true, run terraform apply when changes exist"
+    required: false
+    default: "true"
+
+  approvers:
+    description: "Comma-separated GitHub usernames allowed to approve. Empty means no approval gate."
+    required: false
+    default: "kemeattang"
+
+  minimum_approvals:
+    description: "Minimum approvals required if approvers is set"
+    required: false
+    default: "1"
+
+  approval_token:
+    description: "GitHub token used by manual approval action"
+    required: false
+    default: ""
+
+  slack_webhook_url:
+    description: "Slack webhook URL for deployment notifications"
+    required: false
+    default: ""
+
+outputs:
+  has_changes:
+    description: "Whether Terraform detected changes"
+    value: ${{ steps.terraform-plan.outputs.has_changes }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+
+    - name: Configure AWS credentials with OIDC
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ inputs.aws_role_arn }}
+        aws-region: ${{ inputs.aws_region }}
+
+    - name: Configure private Terraform modules
+      if: ${{ inputs.github_token != '' }}
+      shell: bash
+      run: |
+        git config --global url."https://git:${{ inputs.github_token }}@github.com/".insteadOf "https://github.com/"
+
+    - name: Terraform Init
+      shell: bash
+      run: |
+        set -euo pipefail
+        terraform -chdir=${{ inputs.working_directory }} init
+
+    - name: Select or Create Workspace
+      shell: bash
+      run: |
+        set -euo pipefail
+        ENV="${{ inputs.environment }}"
+
+        terraform -chdir=${{ inputs.working_directory }} workspace list | grep -q " ${ENV}$" \
+          && terraform -chdir=${{ inputs.working_directory }} workspace select "$ENV" \
+          || terraform -chdir=${{ inputs.working_directory }} workspace new "$ENV"
+
+    - name: Terraform Format Check
+      shell: bash
+      run: |
+        terraform -chdir=${{ inputs.working_directory }} fmt -check -recursive
+
+    - name: Terraform Validate
+      shell: bash
+      run: |
+        terraform -chdir=${{ inputs.working_directory }} validate
+
+    - id: terraform-plan
+      name: Terraform Plan
+      shell: bash
+      run: |
+        set +e
+
+        terraform -chdir=${{ inputs.working_directory }} plan \
+          -var-file=vars/${{ inputs.environment }}.tfvars \
+          -out=tfplan \
+          -detailed-exitcode
+
+        CODE=$?
+        set -e
+
+        if [ "$CODE" -eq 0 ]; then
+          echo "No changes detected."
+          HAS_CHANGES="false"
+        elif [ "$CODE" -eq 2 ]; then
+          echo "Changes detected."
+          HAS_CHANGES="true"
+        else
+          echo "Terraform plan failed with exit code $CODE"
+          exit "$CODE"
+        fi
+
+        terraform -chdir=${{ inputs.working_directory }} show -no-color tfplan > plan.txt
+        mv plan.txt ${{ inputs.working_directory }}/plan.txt
+
+        echo "has_changes=$HAS_CHANGES" >> "$GITHUB_OUTPUT"
+
+    - name: Upload Plan Artifacts
+      if: ${{ steps.terraform-plan.outputs.has_changes == 'true' }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: tfplan-${{ inputs.environment }}
+        path: |
+          ${{ inputs.working_directory }}/tfplan
+          ${{ inputs.working_directory }}/plan.txt
+
+    - name: Notify Slack about pending approval
+      if: ${{ inputs.slack_webhook_url != '' && steps.terraform-plan.outputs.has_changes == 'true' }}
+      shell: bash
+      env:
+        SLACK_WEBHOOK_URL: ${{ inputs.slack_webhook_url }}
+      run: |
+        RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        ENVIRONMENT="${{ inputs.environment }}"
+
+        cat <<EOF > payload.json
+        {
+          "text": "Terraform apply pending approval for ${ENVIRONMENT}. Workflow run: ${RUN_URL}"
+        }
+        EOF
+
+        curl -X POST \
+          -H "Content-Type: application/json" \
+          --data @payload.json \
+          "$SLACK_WEBHOOK_URL"
+
+    - name: Build Approval Issue Body
+      if: ${{ inputs.approvers != '' && steps.terraform-plan.outputs.has_changes == 'true' }}
+      shell: bash
+      run: |
+        RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+        {
+          echo "Terraform plan for **${{ inputs.environment }}**"
+          echo
+          echo "Workflow run: $RUN_URL"
+          echo
+          echo "## Plan Output"
+          echo
+          echo '```'
+          cat "${{ inputs.working_directory }}/plan.txt"
+          echo '```'
+        } > approval_issue_body.md
+
+    - name: Manual Approval Before Apply
+      if: ${{ inputs.approvers != '' && steps.terraform-plan.outputs.has_changes == 'true' }}
+      uses: trstringer/manual-approval@v1
+      with:
+        approvers: ${{ inputs.approvers }}
+        minimum-approvals: ${{ inputs.minimum_approvals }}
+        issue-title: "Approve Terraform Apply for ${{ inputs.environment }}"
+        issue-body-file-path: approval_issue_body.md
+        secret: ${{ inputs.approval_token }}
+
+    - id: terraform-apply
+      name: Terraform Apply
+      if: ${{ inputs.run_apply == 'true' && steps.terraform-plan.outputs.has_changes == 'true' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        terraform -chdir=${{ inputs.working_directory }} apply -auto-approve tfplan
